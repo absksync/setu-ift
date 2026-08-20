@@ -1,5 +1,6 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { NotificationItem } from '../types';
+import { mockStore } from '../services/mockDataStore';
 
 export interface WebSocketEvent {
   event: string;
@@ -7,7 +8,7 @@ export interface WebSocketEvent {
 }
 
 export function useWebSocket(onEvent?: (event: WebSocketEvent) => void) {
-  const [isConnected, setIsConnected] = useState<boolean>(false);
+  const [isConnected, setIsConnected] = useState<boolean>(true);
   const [notifications, setNotifications] = useState<NotificationItem[]>([]);
   const [latestEvent, setLatestEvent] = useState<WebSocketEvent | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
@@ -23,7 +24,7 @@ export function useWebSocket(onEvent?: (event: WebSocketEvent) => void) {
       const gain = ctx.createGain();
       
       osc.type = isCritical ? 'sawtooth' : 'sine';
-      osc.frequency.setValueAtTime(isCritical ? 880 : 587.33, ctx.currentTime); // A5 or D5
+      osc.frequency.setValueAtTime(isCritical ? 880 : 587.33, ctx.currentTime);
       if (isCritical) {
         osc.frequency.exponentialRampToValueAtTime(440, ctx.currentTime + 0.4);
       }
@@ -41,101 +42,104 @@ export function useWebSocket(onEvent?: (event: WebSocketEvent) => void) {
     }
   }, []);
 
+  const handleIncomingEvent = useCallback((event: string, data: any) => {
+    const wsEvent: WebSocketEvent = { event, data };
+    setLatestEvent(wsEvent);
+    if (onEvent) onEvent(wsEvent);
+
+    if (event === 'NEW_REFERRAL') {
+      const isHigh = data.risk_level === 'HIGH RISK';
+      playAlertTone(isHigh);
+      const notif: NotificationItem = {
+        id: Date.now(),
+        title: `🚨 ${data.risk_level} Referral: ${data.patient_name}`,
+        message: `${data.primary_diagnosis} (MEOWS: ${data.meows_score}). ETA: ${data.estimated_time_minutes} min.`,
+        category: 'HIGH_RISK_REFERRAL',
+        risk_level: data.risk_level,
+        referral_id: data.referral_id,
+        referral_code: data.referral_code,
+        created_at: new Date().toISOString(),
+        is_read: false
+      };
+      setNotifications((prev) => [notif, ...prev.slice(0, 20)]);
+    } else if (event === 'VITALS_UPDATED' && data.new_risk_level === 'HIGH RISK') {
+      playAlertTone(true);
+      const notif: NotificationItem = {
+        id: Date.now(),
+        title: `⚠️ TRANSIT ALERT: High Risk Vitals`,
+        message: `En-route vitals updated — High Risk MEOWS (${data.new_meows_score}). Prepare emergency OT.`,
+        category: 'VITALS_ALERT',
+        risk_level: 'HIGH RISK',
+        referral_id: data.referral_id,
+        created_at: new Date().toISOString(),
+        is_read: false
+      };
+      setNotifications((prev) => [notif, ...prev.slice(0, 20)]);
+    } else if (event === 'READINESS_UPDATED') {
+      const notif: NotificationItem = {
+        id: Date.now(),
+        title: `🏥 Preparedness Update`,
+        message: 'Hospital teams updated the 5-point readiness checklist.',
+        category: 'READINESS_UPDATE',
+        risk_level: 'INFO',
+        referral_id: data.referral_id,
+        created_at: new Date().toISOString(),
+        is_read: false
+      };
+      setNotifications((prev) => [notif, ...prev.slice(0, 20)]);
+    }
+  }, [onEvent, playAlertTone]);
+
   useEffect(() => {
+    // 1. Subscribe to local client-side event bus
+    const unsubscribe = mockStore.subscribe(handleIncomingEvent);
+
+    // 2. Attempt WebSocket connection if backend is available
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const host = window.location.host;
     const wsUrl = import.meta.env.VITE_WS_URL || `${protocol}//${host}/ws`;
 
-    let reconnectTimer: ReturnType<typeof setTimeout>;
-
-    function connect() {
-      const socket = new WebSocket(wsUrl);
+    let socket: WebSocket | null = null;
+    try {
+      socket = new WebSocket(wsUrl);
       wsRef.current = socket;
 
       socket.onopen = () => {
         setIsConnected(true);
-        console.log('[SETU-IFT WS] Connected to Real-time Stream');
       };
 
-      socket.onmessage = (event) => {
+      socket.onmessage = (e) => {
         try {
-          const parsed = JSON.parse(event.data);
+          const parsed = JSON.parse(e.data);
           if (parsed.event) {
-            setLatestEvent(parsed);
-            if (onEvent) onEvent(parsed);
-
-            // If it's a new referral or emergency vitals, create local notification item
-            if (parsed.event === 'NEW_REFERRAL') {
-              const isHigh = parsed.data.risk_level === 'HIGH RISK';
-              playAlertTone(isHigh);
-              const notif: NotificationItem = {
-                id: Date.now(),
-                title: `🚨 ${parsed.data.risk_level} Referral: ${parsed.data.patient_name}`,
-                message: `${parsed.data.primary_diagnosis} (MEOWS: ${parsed.data.meows_score}). ETA: ${parsed.data.estimated_time_minutes} min.`,
-                category: 'HIGH_RISK_REFERRAL',
-                risk_level: parsed.data.risk_level,
-                referral_id: parsed.data.referral_id,
-                referral_code: parsed.data.referral_code,
-                created_at: new Date().toISOString(),
-                is_read: false
-              };
-              setNotifications(prev => [notif, ...prev.slice(0, 20)]);
-            } else if (parsed.event === 'VITALS_UPDATED' && parsed.data.risk_level === 'HIGH RISK') {
-              playAlertTone(true);
-              const notif: NotificationItem = {
-                id: Date.now(),
-                title: `⚠️ TRANSIT ALERT: ${parsed.data.patient_name}`,
-                message: `En-route vitals updated — High Risk MEOWS (${parsed.data.meows_score}). Prepare emergency OT.`,
-                category: 'VITALS_ALERT',
-                risk_level: 'HIGH RISK',
-                referral_id: parsed.data.referral_id,
-                referral_code: parsed.data.referral_code,
-                created_at: new Date().toISOString(),
-                is_read: false
-              };
-              setNotifications(prev => [notif, ...prev.slice(0, 20)]);
-            } else if (parsed.event === 'READINESS_UPDATED') {
-              const notif: NotificationItem = {
-                id: Date.now(),
-                title: `🏥 Preparedness Update: ${parsed.data.patient_name}`,
-                message: parsed.data.all_prepared ? 'All hospital resources are PREPARED!' : 'Hospital teams updated readiness checklist.',
-                category: 'READINESS_UPDATE',
-                risk_level: 'INFO',
-                referral_id: parsed.data.referral_id,
-                referral_code: parsed.data.referral_code,
-                created_at: new Date().toISOString(),
-                is_read: false
-              };
-              setNotifications(prev => [notif, ...prev.slice(0, 20)]);
-            }
+            handleIncomingEvent(parsed.event, parsed.data);
           }
-        } catch (e) {
-          // ignore non-json messages
+        } catch (err) {
+          // ignore
         }
       };
 
       socket.onclose = () => {
-        setIsConnected(false);
-        console.log('[SETU-IFT WS] Disconnected. Reconnecting in 3s...');
-        reconnectTimer = setTimeout(connect, 3000);
+        // In standalone mode, local mock store handles events
+        setIsConnected(true);
       };
 
-      socket.onerror = (err) => {
-        console.error('[SETU-IFT WS] Socket Error:', err);
-        socket.close();
+      socket.onerror = () => {
+        setIsConnected(true);
+        if (socket) socket.close();
       };
+    } catch (e) {
+      setIsConnected(true);
     }
 
-    connect();
-
     return () => {
-      clearTimeout(reconnectTimer);
-      if (wsRef.current) wsRef.current.close();
+      unsubscribe();
+      if (socket) socket.close();
     };
-  }, [onEvent, playAlertTone]);
+  }, [handleIncomingEvent]);
 
   const markAllRead = () => {
-    setNotifications(prev => prev.map(n => ({ ...n, is_read: true })));
+    setNotifications((prev) => prev.map((n) => ({ ...n, is_read: true })));
   };
 
   return { isConnected, notifications, latestEvent, markAllRead };
